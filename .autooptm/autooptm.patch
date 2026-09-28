@@ -1,0 +1,331 @@
+diff --git a/inference_video.py b/inference_video.py
+index 68793c0f395b1902a4afaf3f42aed33f72b93c2c..151083cdba8437d036894672a7d498f454c2a943 100644
+--- a/inference_video.py
++++ b/inference_video.py
+@@ -67,7 +67,24 @@ parser.add_argument('--fps', dest='fps', type=int, default=None)
+ parser.add_argument('--png', dest='png', action='store_true', help='whether to vid_out png format vid_outs')
+ parser.add_argument('--ext', dest='ext', type=str, default='mp4', help='vid_out video extension')
+ parser.add_argument('--exp', dest='exp', type=int, default=1)
++parser.add_argument('--compat', dest='compat', action='store_true',
++                    help='run the original path exactly')
++parser.add_argument('--bit-exact', dest='bit_exact', action='store_true',
++                    help='keep only the changes that cannot change a pixel')
++parser.add_argument('--no-opt-refine', dest='no_opt_refine', action='store_true',
++                    help='disable the refine-tail optimization; '
++                         '--bit-exact implies this')
+ args = parser.parse_args()
++if args.compat:
++    os.environ['RIFE_COMPAT'] = '1'
++_FAST = not args.compat
++_BITEXACT = args.bit_exact and _FAST
++if _BITEXACT:
++    os.environ['RIFE_NO_OPT_2'] = '1'
++_OPT_REFINE = _FAST and not _BITEXACT and not args.no_opt_refine
++if _FAST and not _BITEXACT:
++    os.environ.setdefault('OPENCV_FFMPEG_WRITER_OPTIONS',
++                          'threads;%s' % os.environ.get('RIFE_OPT_1', '8'))
+ assert (not args.video is None or not args.img is None)
+ if args.skip:
+     print("skip flag is abandoned, please refer to issue #207.")
+@@ -77,6 +94,7 @@ assert args.scale in [0.25, 0.5, 1.0, 2.0, 4.0]
+ if not args.img is None:
+     args.png = True
+ 
++_src_bgr = False
+ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ torch.set_grad_enabled(False)
+ if torch.cuda.is_available():
+@@ -110,6 +128,52 @@ except:
+ model.eval()
+ model.device()
+ 
++if _OPT_REFINE:
++    import model.refine as _refine
++
++    def _opt_wrap(orig):
++        def f(self, *a, **k):
++            with torch.autocast('cuda', dtype=torch.float16):
++                out = orig(self, *a, **k)
++            if torch.is_tensor(out):
++                return out.float()
++            if isinstance(out, (list, tuple)):
++                return type(out)(o.float() if torch.is_tensor(o) else o for o in out)
++            return out
++        return f
++    _refine.Contextnet.forward = _opt_wrap(_refine.Contextnet.forward)
++    _refine.Unet.forward = _opt_wrap(_refine.Unet.forward)
++
++if _FAST and torch.cuda.is_available():
++    class _StepFlownet(torch.nn.Module):
++        def __init__(self, m, warmup=3):
++            super().__init__()
++            self.m, self.warmup, self.cache = m, warmup, {}
++
++        def forward(self, i0, i1, sc):
++            key = (i0.dtype, i0.shape[2], i0.shape[3])
++            if key not in self.cache:
++                si0, si1 = i0.clone(), i1.clone()
++                side = torch.cuda.Stream()
++                side.wait_stream(torch.cuda.current_stream())
++                with torch.cuda.stream(side):
++                    for _ in range(self.warmup):
++                        self.m.inference(si0, si1, sc)
++                torch.cuda.current_stream().wait_stream(side)
++                torch.cuda.synchronize()
++                g = torch.cuda.CUDAGraph()
++                with torch.cuda.graph(g):
++                    so = self.m.inference(si0, si1, sc)
++                self.cache[key] = (si0, si1, so, g)
++            si0, si1, so, g = self.cache[key]
++            si0.copy_(i0)
++            si1.copy_(i1)
++            g.replay()
++            return so.clone()
++    _infer = _StepFlownet(model)
++else:
++    _infer = lambda i0, i1, sc: model.inference(i0, i1, sc)
++
+ if not args.video is None:
+     videoCapture = cv2.VideoCapture(args.video)
+     fps = videoCapture.get(cv2.CAP_PROP_FPS)
+@@ -120,7 +184,23 @@ if not args.video is None:
+         args.fps = fps * (2 ** args.exp)
+     else:
+         fpsNotAssigned = False
+-    videogen = skvideo.io.vreader(args.video)
++    videogen = None
++    if _FAST and not _BITEXACT:
++        _cap = cv2.VideoCapture(args.video)
++        if _cap.isOpened():
++            _src_bgr = True
++
++            def _cv2_frames(cap):
++                while True:
++                    ok, fr = cap.read()
++                    if not ok:
++                        break
++                    yield fr
++            videogen = _cv2_frames(_cap)
++        else:
++            _cap.release()
++    if videogen is None:
++        videogen = skvideo.io.vreader(args.video)
+     lastframe = next(videogen)
+     fourcc = cv2.VideoWriter_fourcc('m', 'p', '4', 'v')
+     video_path_wo_ext, ext = os.path.splitext(args.video)
+@@ -158,10 +238,11 @@ def clear_write_buffer(user_args, write_buffer):
+         if item is None:
+             break
+         if user_args.png:
+-            cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt), item[:, :, ::-1])
++            cv2.imwrite('vid_out/{:0>7d}.png'.format(cnt),
++                        item if _FAST else item[:, :, ::-1])
+             cnt += 1
+         else:
+-            vid_out.write(item[:, :, ::-1])
++            vid_out.write(item if _FAST else item[:, :, ::-1])
+ 
+ def build_read_buffer(user_args, read_buffer, videogen):
+     try:
+@@ -177,7 +258,7 @@ def build_read_buffer(user_args, read_buffer, videogen):
+ 
+ def make_inference(I0, I1, n):
+     global model
+-    middle = model.inference(I0, I1, args.scale)
++    middle = _infer(I0, I1, args.scale)
+     if n == 1:
+         return [middle]
+     first_half = make_inference(I0, middle, n=n//2)
+@@ -193,6 +274,27 @@ def pad_image(img):
+     else:
+         return F.pad(img, padding)
+ 
++def _load_frame(frame):
++    if _FAST:
++        t = torch.from_numpy(frame).to(device, non_blocking=True)
++        if _src_bgr:
++            t = t[:, :, [2, 1, 0]]
++        t = (t.permute(2, 0, 1).unsqueeze(0).float() / 255.).contiguous()
++    else:
++        t = torch.from_numpy(np.transpose(frame, (2, 0, 1))).to(
++            device, non_blocking=True).unsqueeze(0).float() / 255.
++    return pad_image(t)
++
++def _store_frame(t):
++    if _FAST:
++        return t.byte().flip(0).permute(1, 2, 0)[:h, :w].contiguous().cpu().numpy()
++    return t.byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
++
++def to_writer(src_frame):
++    if _src_bgr == _FAST:
++        return src_frame
++    return np.ascontiguousarray(src_frame[:, :, ::-1])
++
+ if args.montage:
+     left = w // 4
+     w = w // 2
+@@ -208,8 +310,8 @@ read_buffer = Queue(maxsize=500)
+ _thread.start_new_thread(build_read_buffer, (args, read_buffer, videogen))
+ _thread.start_new_thread(clear_write_buffer, (args, write_buffer))
+ 
+-I1 = torch.from_numpy(np.transpose(lastframe, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+-I1 = pad_image(I1)
++I1 = _load_frame(lastframe)
++I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
+ temp = None # save lastframe when processing static frame
+ 
+ while True:
+@@ -221,9 +323,9 @@ while True:
+     if frame is None:
+         break
+     I0 = I1
+-    I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+-    I1 = pad_image(I1)
+-    I0_small = F.interpolate(I0, (32, 32), mode='bilinear', align_corners=False)
++    I0_small = I1_small if _FAST else F.interpolate(
++        I0, (32, 32), mode='bilinear', align_corners=False)
++    I1 = _load_frame(frame)
+     I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
+     ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
+ 
+@@ -235,48 +337,40 @@ while True:
+             frame = lastframe
+         else:
+             temp = frame
+-        I1 = torch.from_numpy(np.transpose(frame, (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.
+-        I1 = pad_image(I1)
+-        I1 = model.inference(I0, I1, args.scale)
++        I1 = _load_frame(frame)
++        I1 = _infer(I0, I1, args.scale)
+         I1_small = F.interpolate(I1, (32, 32), mode='bilinear', align_corners=False)
+         ssim = ssim_matlab(I0_small[:, :3], I1_small[:, :3])
+         frame = (I1[0] * 255).byte().cpu().numpy().transpose(1, 2, 0)[:h, :w]
++        if _src_bgr:
++            frame = np.ascontiguousarray(frame[:, :, ::-1])
+     
+     if ssim < 0.2:
+         output = []
+         for i in range((2 ** args.exp) - 1):
+             output.append(I0)
+-        '''
+-        output = []
+-        step = 1 / (2 ** args.exp)
+-        alpha = 0
+-        for i in range((2 ** args.exp) - 1):
+-            alpha += step
+-            beta = 1-alpha
+-            output.append(torch.from_numpy(np.transpose((cv2.addWeighted(frame[:, :, ::-1], alpha, lastframe[:, :, ::-1], beta, 0)[:, :, ::-1].copy()), (2,0,1))).to(device, non_blocking=True).unsqueeze(0).float() / 255.)
+-        '''
+     else:
+         output = make_inference(I0, I1, 2**args.exp-1) if args.exp else []
+ 
+     if args.montage:
+-        write_buffer.put(np.concatenate((lastframe, lastframe), 1))
++        lf = to_writer(lastframe)
++        write_buffer.put(np.concatenate((lf, lf), 1))
+         for mid in output:
+-            mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
+-            write_buffer.put(np.concatenate((lastframe, mid[:h, :w]), 1))
++            write_buffer.put(np.concatenate((lf, _store_frame(mid[0] * 255.)), 1))
+     else:
+-        write_buffer.put(lastframe)
++        write_buffer.put(to_writer(lastframe))
+         for mid in output:
+-            mid = (((mid[0] * 255.).byte().cpu().numpy().transpose(1, 2, 0)))
+-            write_buffer.put(mid[:h, :w])
++            write_buffer.put(_store_frame(mid[0] * 255.))
+     pbar.update(1)
+     lastframe = frame
+     if break_flag:
+         break
+ 
+ if args.montage:
+-    write_buffer.put(np.concatenate((lastframe, lastframe), 1))
++    _lf = to_writer(lastframe)
++    write_buffer.put(np.concatenate((_lf, _lf), 1))
+ else:
+-    write_buffer.put(lastframe)
++    write_buffer.put(to_writer(lastframe))
+ 
+ write_buffer.put(None)
+ 
+diff --git a/model/IFNet.py b/model/IFNet.py
+index cb31995c4c1aef6591a41cd3f2062311fddf56ca..55d85ff17e94fdc125f4de98dbed20e8475bf35b 100644
+--- a/model/IFNet.py
++++ b/model/IFNet.py
+@@ -3,6 +3,10 @@ import torch.nn as nn
+ import torch.nn.functional as F
+ from model.warplayer import warp
+ from model.refine import *
++import os
++
++_INFER_FAST = os.environ.get("RIFE_COMPAT", "") not in ("1", "true", "True")
++_BATCH_CTX = os.environ.get("RIFE_NO_OPT_2", "") not in ("1", "true", "True")
+ 
+ def deconv(in_planes, out_planes, kernel_size=4, stride=2, padding=1):
+     return nn.Sequential(
+@@ -71,6 +75,7 @@ class IFNet(nn.Module):
+         warped_img1 = img1
+         flow = None 
+         loss_distill = 0
++        fast = _INFER_FAST and gt.shape[1] != 3
+         stu = [self.block0, self.block1, self.block2]
+         for i in range(3):
+             if flow != None:
+@@ -79,7 +84,7 @@ class IFNet(nn.Module):
+                 mask = mask + mask_d
+             else:
+                 flow, mask = stu[i](torch.cat((img0, img1), 1), None, scale=scale[i])
+-            mask_list.append(torch.sigmoid(mask))
++            mask_list.append(torch.sigmoid(mask) if (i == 2 or not fast) else None)
+             flow_list.append(flow)
+             warped_img0 = warp(img0, flow[:, :2])
+             warped_img1 = warp(img1, flow[:, 2:4])
+@@ -95,13 +100,19 @@ class IFNet(nn.Module):
+         else:
+             flow_teacher = None
+             merged_teacher = None
+-        for i in range(3):
++        for i in (range(2, 3) if fast else range(3)):
+             merged[i] = merged[i][0] * mask_list[i] + merged[i][1] * (1 - mask_list[i])
+             if gt.shape[1] == 3:
+                 loss_mask = ((merged[i] - gt).abs().mean(1, True) > (merged_teacher - gt).abs().mean(1, True) + 0.01).float().detach()
+                 loss_distill += (((flow_teacher.detach() - flow_list[i]) ** 2).mean(1, True) ** 0.5 * loss_mask).mean()
+-        c0 = self.contextnet(img0, flow[:, :2])
+-        c1 = self.contextnet(img1, flow[:, 2:4])
++        if fast and _BATCH_CTX:
++            cc = self.contextnet(torch.cat((img0, img1), 0),
++                                 torch.cat((flow[:, :2], flow[:, 2:4]), 0))
++            c0 = [t[:1] for t in cc]
++            c1 = [t[1:] for t in cc]
++        else:
++            c0 = self.contextnet(img0, flow[:, :2])
++            c1 = self.contextnet(img1, flow[:, 2:4])
+         tmp = self.unet(img0, img1, warped_img0, warped_img1, mask, flow, c0, c1)
+         res = tmp[:, :3] * 2 - 1
+         merged[2] = torch.clamp(merged[2] + res, 0, 1)
+diff --git a/model/warplayer.py b/model/warplayer.py
+index 21b0b904cf71b297fd43813134c57d13a3ae9e4a..364288c968985e237031f60571ccb516f31ed2d4 100644
+--- a/model/warplayer.py
++++ b/model/warplayer.py
+@@ -6,14 +6,16 @@ backwarp_tenGrid = {}
+ 
+ 
+ def warp(tenInput, tenFlow):
+-    k = (str(tenFlow.device), str(tenFlow.size()))
++    k = (tenFlow.device.type, tenFlow.device.index, tenFlow.dtype,
++         tenFlow.shape[0], tenFlow.shape[2], tenFlow.shape[3])
+     if k not in backwarp_tenGrid:
+-        tenHorizontal = torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=device).view(
++        dt = tenFlow.dtype
++        tenHorizontal = torch.linspace(-1.0, 1.0, tenFlow.shape[3], device=tenFlow.device, dtype=dt).view(
+             1, 1, 1, tenFlow.shape[3]).expand(tenFlow.shape[0], -1, tenFlow.shape[2], -1)
+-        tenVertical = torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=device).view(
++        tenVertical = torch.linspace(-1.0, 1.0, tenFlow.shape[2], device=tenFlow.device, dtype=dt).view(
+             1, 1, tenFlow.shape[2], 1).expand(tenFlow.shape[0], -1, -1, tenFlow.shape[3])
+         backwarp_tenGrid[k] = torch.cat(
+-            [tenHorizontal, tenVertical], 1).to(device)
++            [tenHorizontal, tenVertical], 1)
+ 
+     tenFlow = torch.cat([tenFlow[:, 0:1, :, :] / ((tenInput.shape[3] - 1.0) / 2.0),
+                          tenFlow[:, 1:2, :, :] / ((tenInput.shape[2] - 1.0) / 2.0)], 1)

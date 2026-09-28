@@ -3,6 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model.warplayer import warp
 from model.refine import *
+import os
+
+_INFER_FAST = os.environ.get("RIFE_COMPAT", "") not in ("1", "true", "True")
+_BATCH_CTX = os.environ.get("RIFE_NO_OPT_2", "") not in ("1", "true", "True")
 
 def deconv(in_planes, out_planes, kernel_size=4, stride=2, padding=1):
     return nn.Sequential(
@@ -71,6 +75,7 @@ class IFNet(nn.Module):
         warped_img1 = img1
         flow = None 
         loss_distill = 0
+        fast = _INFER_FAST and gt.shape[1] != 3
         stu = [self.block0, self.block1, self.block2]
         for i in range(3):
             if flow != None:
@@ -79,7 +84,7 @@ class IFNet(nn.Module):
                 mask = mask + mask_d
             else:
                 flow, mask = stu[i](torch.cat((img0, img1), 1), None, scale=scale[i])
-            mask_list.append(torch.sigmoid(mask))
+            mask_list.append(torch.sigmoid(mask) if (i == 2 or not fast) else None)
             flow_list.append(flow)
             warped_img0 = warp(img0, flow[:, :2])
             warped_img1 = warp(img1, flow[:, 2:4])
@@ -95,13 +100,19 @@ class IFNet(nn.Module):
         else:
             flow_teacher = None
             merged_teacher = None
-        for i in range(3):
+        for i in (range(2, 3) if fast else range(3)):
             merged[i] = merged[i][0] * mask_list[i] + merged[i][1] * (1 - mask_list[i])
             if gt.shape[1] == 3:
                 loss_mask = ((merged[i] - gt).abs().mean(1, True) > (merged_teacher - gt).abs().mean(1, True) + 0.01).float().detach()
                 loss_distill += (((flow_teacher.detach() - flow_list[i]) ** 2).mean(1, True) ** 0.5 * loss_mask).mean()
-        c0 = self.contextnet(img0, flow[:, :2])
-        c1 = self.contextnet(img1, flow[:, 2:4])
+        if fast and _BATCH_CTX:
+            cc = self.contextnet(torch.cat((img0, img1), 0),
+                                 torch.cat((flow[:, :2], flow[:, 2:4]), 0))
+            c0 = [t[:1] for t in cc]
+            c1 = [t[1:] for t in cc]
+        else:
+            c0 = self.contextnet(img0, flow[:, :2])
+            c1 = self.contextnet(img1, flow[:, 2:4])
         tmp = self.unet(img0, img1, warped_img0, warped_img1, mask, flow, c0, c1)
         res = tmp[:, :3] * 2 - 1
         merged[2] = torch.clamp(merged[2] + res, 0, 1)

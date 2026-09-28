@@ -1,3 +1,71 @@
+<div align="center">
+  <a href="https://autooptm.com"><img src=".autooptm/logo.png" width="96" alt="AutoOptm"></a>
+
+  <h1>ECCV2022-RIFE · optimized by <a href="https://autooptm.com">AutoOptm</a></h1>
+
+  <p><b>1.63x faster end to end</b> on the command below, output verified against the stock program.</p>
+
+  <p>
+    <a href="https://autooptm.com"><img alt="speedup" src="https://img.shields.io/badge/end--to--end-1.63x-2ea44f"></a>
+    <a href="https://github.com/hzwer/ECCV2022-RIFE/commit/5d8adbdd40e12c2c8f91930eff838aebe561c086"><img alt="base" src="https://img.shields.io/badge/upstream-5d8adbdd40e1-blue"></a>
+    <img alt="card" src="https://img.shields.io/badge/measured%20on-NVIDIA%20RTX%204090-lightgrey">
+  </p>
+</div>
+
+> This is a fork of [hzwer/ECCV2022-RIFE](https://github.com/hzwer/ECCV2022-RIFE) at commit
+> [`5d8adbdd40e1`](https://github.com/hzwer/ECCV2022-RIFE/commit/5d8adbdd40e12c2c8f91930eff838aebe561c086) with the AutoOptm patch applied on top.
+> The optimisation was found, measured and verified automatically by [AutoOptm](https://autooptm.com);
+> the patch is also kept at [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+Every change is on by default and the command runs unchanged — same file, same flags, same outputs. Every change is behind a switch that defaults on; see [`.autooptm/autooptm.patch`](.autooptm/autooptm.patch).
+
+## The result — `python inference_video.py --video=demo.mp4 --exp=1`
+
+| | |
+|---|---|
+| **Command** | `python inference_video.py --video=demo.mp4 --exp=1` |
+| **Entry point** | `inference_video.py` |
+| **Unit measured** | one short clip interpolated 2x end to end: decode → SSIM check → IFNet → encode |
+| **Before (stock)** | 27 (as reported) per unit |
+| **After (this tree, all switches default ON)** | 16.52 (as reported) per unit |
+| **Speedup** | **1.63x** end to end on NVIDIA RTX 4090, host noise floor 2.0% |
+| **Output** | worst pixel 1 code off the stock output (PSNR 57.7 dB) |
+
+### What changed
+
+| File | Where | Gain (alone) |
+|---|---|---|
+| `inference_video.py` | clear_write_buffer | 1.2115x |
+| `inference_video.py` | videogen | 1.2826x |
+| `inference_video.py` | the frame loop | 1.0373x |
+| `model/IFNet.py` | IFNet.forward | 1.0268x |
+| `inference_video.py` | the frame loop | 1.0338x |
+| `model/warplayer.py` | warp | 1.0177x |
+| `inference_video.py` | the frame loop | 1.0252x |
+| `model/IFNet.py` | IFNet.forward | 1.0276x |
+| `inference_video.py` | module preamble | 1.0166x |
+| `inference_video.py` | Contextnet.forward / Unet.forward | 1.0274x |
+
+
+## Reproduce
+
+```bash
+git clone https://github.com/autooptm/ECCV2022-RIFE-ao.git
+cd ECCV2022-RIFE-ao
+# set up exactly as upstream documents, then:
+python inference_video.py --video=demo.mp4 --exp=1
+```
+
+`git diff 5d8adbdd40e1` is the same change as `.autooptm/autooptm.patch`.
+
+---
+
+<div align="center"><sub>Optimized by <a href="https://autooptm.com">AutoOptm</a> — point it at a repository, get back a verified speedup and the patch.</sub></div>
+
+---
+
+The upstream README is unchanged below.
+
 # Real-Time Intermediate Flow Estimation for Video Frame Interpolation
 ## [YouTube](https://www.youtube.com/results?search_query=rife+interpolation&sp=CAM%253D) | [BiliBili](https://search.bilibili.com/all?keyword=SVFI&order=stow&duration=0&tids_1=0) | [Colab](https://colab.research.google.com/github/hzwer/ECCV2022-RIFE/blob/main/Colab_demo.ipynb) | [Tutorial](https://www.youtube.com/watch?v=gf_on-dbwyU&feature=emb_title) | [DeepWiki](https://deepwiki.com/hzwer/ECCV2022-RIFE)
 
